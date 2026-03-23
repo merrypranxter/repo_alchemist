@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Courier New", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg: #08080e;
+  --color-panel: #0f0f18;
+  --color-panel2: #14141f;
+  --color-border: #22223a;
+  --color-border2: #2e2e50;
+  --color-accent: #7b2fff;
+  --color-accent2: #00e5ff;
+  --color-accent3: #ff2fff;
+  --color-text: #dde0f5;
+  --color-muted: #4a4a70;
+  --color-success: #00ff9d;
+}
+
+@layer base {
+  body {
+    @apply bg-bg text-text font-sans overflow-hidden h-screen flex flex-col;
+  }
+
+  * {
+    @apply box-border m-0 p-0;
+  }
+}
+
+@layer components {
+  .control-section {
+    @apply p-4 border-b border-border flex flex-col gap-2;
+  }
+
+  .section-label {
+    @apply text-[0.6rem] tracking-[0.2em] text-muted uppercase mb-1;
+  }
+
+  label {
+    @apply text-[0.65rem] tracking-[0.1em] text-muted uppercase mt-1;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  select,
+  textarea {
+    @apply w-full bg-panel2 border border-border text-text font-sans text-[0.8rem] p-2 outline-none transition-colors duration-150 focus:border-accent;
+  }
+
+  .model-card {
+    @apply border border-border p-3 cursor-pointer transition-all duration-150 hover:border-accent2;
+  }
+
+  .model-card.selected {
+    @apply border-accent bg-[rgba(123,47,255,0.12)];
+  }
+
+  .ratio-btn, .res-btn, .count-btn {
+    @apply bg-panel2 border border-border text-muted font-sans text-[0.7rem] px-3 py-1.5 cursor-pointer tracking-[0.08em] transition-all duration-150 hover:border-accent2 hover:text-accent2;
+  }
+
+  .ratio-btn.selected, .res-btn.selected, .count-btn.selected {
+    @apply border-accent text-accent bg-[rgba(123,47,255,0.15)];
+  }
+
+  .count-btn.selected {
+    @apply border-accent3 text-accent3 bg-[rgba(255,47,255,0.1)];
+  }
+
+  button.primary {
+    @apply bg-accent border border-accent text-white font-sans text-[0.95rem] p-3 cursor-pointer tracking-[0.2em] font-bold w-full transition-colors duration-150 hover:bg-[#9b4fff] disabled:opacity-30 disabled:cursor-not-allowed;
+  }
+
+  .image-cell {
+    @apply bg-panel relative flex items-center justify-center overflow-hidden;
+  }
+
+  .image-cell img {
+    @apply w-full h-full object-contain;
+  }
+
+  .cell-export {
+    @apply absolute bottom-2 right-2 bg-[rgba(0,0,0,0.7)] border border-border2 text-text font-sans text-[0.65rem] px-3 py-1.5 cursor-pointer opacity-0 transition-opacity duration-200 tracking-[0.1em] hover:border-success hover:text-success;
+  }
+
+  .image-cell:hover .cell-export {
+    @apply opacity-100;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2e2e50;
+}
+
+/* Grid columns */
+.grid-cols-1 { grid-template-columns: 1fr; }
+.grid-cols-2 { grid-template-columns: 1fr 1fr; }
+.grid-cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+.grid-cols-4 { grid-template-columns: 1fr 1fr; } /* PDF shows 2x2 for 4 images */

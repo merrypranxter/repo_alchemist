@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "Render": {
+      "title": "Render",
+      "description": "A generated image with its associated prompt and repository context.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The UID of the user who generated the image." },
+        "prompt": { "type": "string", "description": "The user's original text prompt." },
+        "negPrompt": { "type": "string", "description": "The negative prompt used." },
+        "fusedPrompt": { "type": "string", "description": "The final prompt fused with repository context." },
+        "repos": { 
+          "type": "array", 
+          "items": { "type": "string" },
+          "description": "The list of repository names mixed for this generation." 
+        },
+        "model": { "type": "string", "description": "The model used for generation." },
+        "aspectRatio": { "type": "string", "description": "The aspect ratio of the generated images." },
+        "resolution": { "type": "string", "description": "The target resolution." },
+        "qualityPreset": { "type": "string", "description": "The quality preset applied." },
+        "lighting": { "type": "string", "description": "The lighting style applied." },
+        "renderStyle": { "type": "string", "description": "The rendering style applied." },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "base64": { "type": "string" },
+              "mimeType": { "type": "string" }
+            }
+          },
+          "description": "The generated images stored as base64 strings."
+        },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the render was created." }
+      },
+      "required": ["userId", "prompt", "repos", "images", "createdAt"]
+    }
+  },
+  "firestore": {
+    "renders": {
+      "schema": "Render",
+      "description": "A collection of all generated images and their metadata."
+    }
+  }
+}

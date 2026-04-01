@@ -3,26 +3,62 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import { GoogleGenAI } from "@google/genai";
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { 
   Github, 
+  Sparkles, 
+  Image as ImageIcon, 
+  Video, 
   Download, 
+  Settings, 
+  ChevronRight,
+  Lock,
+  Globe,
   Loader2,
   Volume2,
   History,
   Clock,
+  User as UserIcon,
+  LogOut,
   Trash2,
   GripVertical,
   GripHorizontal,
   Maximize2,
-  X,
-  Key,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { 
+  auth, 
+  db, 
+  googleProvider, 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged, 
+  collection, 
+  addDoc, 
+  query, 
+  where, 
+  orderBy, 
+  onSnapshot, 
+  serverTimestamp, 
+  limit,
+  handleFirestoreError,
+  OperationType
+} from './firebase';
+import type { User } from './firebase';
 
 // --- Types ---
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
 interface RepoContext {
   repoName: string;
   owner: string;
@@ -52,7 +88,7 @@ interface HistoryItem {
   lighting: string;
   renderStyle: string;
   images: { base64: string; mimeType: string }[];
-  createdAt: string; // ISO 8601 string, e.g. "2024-03-31T12:00:00.000Z"
+  createdAt: any;
 }
 
 interface AppState {
@@ -105,55 +141,8 @@ const RESOLUTIONS = [
   { id: '4096px', label: '4K' },
 ];
 
-// --- Local storage keys ---
-const HISTORY_STORAGE_KEY = 'repo-alchemist-history';
-const GEMINI_KEY_STORAGE_KEY = 'repo-alchemist-gemini-key';
-const HISTORY_MAX = 20;
-
 // --- Helpers ---
 const GH_API = 'https://api.github.com';
-
-/** Read the Gemini API key: env var takes precedence, then localStorage. */
-function getStoredGeminiKey(): string {
-  return import.meta.env.VITE_GEMINI_API_KEY || localStorage.getItem(GEMINI_KEY_STORAGE_KEY) || '';
-}
-
-/** Load render history from localStorage. */
-function loadHistory(): HistoryItem[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as HistoryItem[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Persist a new history item, pruning to HISTORY_MAX entries.
- * Returns a warning string if storage quota was exceeded and items were pruned.
- */
-function saveToHistory(item: HistoryItem, current: HistoryItem[]): { items: HistoryItem[]; warning?: string } {
-  const updated = [item, ...current].slice(0, HISTORY_MAX);
-  try {
-    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(updated));
-    return { items: updated };
-  } catch {
-    // QuotaExceededError – strip images from older entries and retry
-    const lightened = updated.map((h, i) => (i === 0 ? h : { ...h, images: [] }));
-    try {
-      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(lightened));
-      return { items: lightened, warning: 'Storage quota low – older history images were pruned.' };
-    } catch {
-      // Last resort: keep only the newest item
-      try {
-        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify([item]));
-      } catch {
-        // Can't save at all; return in-memory only
-      }
-      return { items: [item], warning: 'Storage quota exceeded. Only the latest render was kept.' };
-    }
-  }
-}
 
 async function getRepos(token: string, username: string) {
   const res = await fetch(
@@ -166,7 +155,8 @@ async function getRepos(token: string, username: string) {
 
 async function getRepoContext(token: string, owner: string, repo: string): Promise<RepoContext> {
   const headers = { Authorization: `Bearer ${token}` };
-
+  
+  // Fetch tree, metadata, and readme in parallel
   const [treeRes, metaRes, readmeRes] = await Promise.all([
     fetch(`${GH_API}/repos/${owner}/${repo}/git/trees/HEAD?recursive=1`, { headers }),
     fetch(`${GH_API}/repos/${owner}/${repo}`, { headers }),
@@ -176,7 +166,10 @@ async function getRepoContext(token: string, owner: string, repo: string): Promi
   if (!treeRes.ok) throw new Error(`Failed to fetch repo tree: ${treeRes.status}`);
   if (!metaRes.ok) throw new Error(`Failed to fetch repo metadata: ${metaRes.status}`);
 
-  const [treeData, meta] = await Promise.all([treeRes.json(), metaRes.json()]);
+  const [treeData, meta] = await Promise.all([
+    treeRes.json(),
+    metaRes.json()
+  ]);
 
   let readme = '';
   if (readmeRes && readmeRes.ok) {
@@ -228,11 +221,10 @@ export default function App() {
     fusedPrompt: '',
   });
 
-  const [geminiKey, setGeminiKey] = useState<string>(() => getStoredGeminiKey());
-  const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
-  const [keyInput, setKeyInput] = useState('');
-  const [isGhOpen, setIsGhOpen] = useState(false);
-  const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
+  const [hasKey, setHasKey] = useState<boolean | null>(null);
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [selectedImage, setSelectedImage] = useState<ImageResult | null>(null);
 
@@ -241,33 +233,83 @@ export default function App() {
       if (e.key === 'Escape') {
         setIsHistoryOpen(false);
         setSelectedImage(null);
-        setIsKeyModalOpen(false);
-        setIsGhOpen(false);
       }
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
   }, []);
 
-  const handleSaveKey = () => {
-    const trimmed = keyInput.trim();
-    if (trimmed) {
-      localStorage.setItem(GEMINI_KEY_STORAGE_KEY, trimmed);
-      setGeminiKey(trimmed);
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setHistory([]);
+      return;
     }
-    setIsKeyModalOpen(false);
-    setKeyInput('');
+
+    const q = query(
+      collection(db, 'renders'),
+      where('userId', '==', user.uid),
+      orderBy('createdAt', 'desc'),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const items: HistoryItem[] = [];
+      snapshot.forEach((doc) => {
+        items.push({ id: doc.id, ...doc.data() } as HistoryItem);
+      });
+      setHistory(items);
+    }, (error) => {
+      // Only handle if it's a permission error, otherwise it might be initial load
+      if (error.message.includes('permission-denied')) {
+        handleFirestoreError(error, OperationType.LIST, 'renders');
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio?.hasSelectedApiKey) {
+        const selected = await window.aistudio.hasSelectedApiKey();
+        setHasKey(selected);
+      } else {
+        setHasKey(true);
+      }
+    };
+    checkKey();
+  }, []);
+
+  const handleSelectKey = async () => {
+    if (window.aistudio?.openSelectKey) {
+      await window.aistudio.openSelectKey();
+      setHasKey(true);
+    }
   };
 
-  const handleClearKey = () => {
-    localStorage.removeItem(GEMINI_KEY_STORAGE_KEY);
-    setGeminiKey(import.meta.env.VITE_GEMINI_API_KEY || '');
-    setKeyInput('');
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setIsAuthOpen(false);
+    } catch (error) {
+      console.error("Logout failed", error);
+    }
   };
 
-  const handleClearHistory = () => {
-    localStorage.removeItem(HISTORY_STORAGE_KEY);
-    setHistory([]);
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+      setIsAuthOpen(false);
+    } catch (error) {
+      console.error("Login failed", error);
+    }
   };
 
   const handleLoadRepos = async () => {
@@ -288,13 +330,21 @@ export default function App() {
     if (!repoName) return;
     const repo = state.repos.find(r => r.name === repoName);
     if (!repo) return;
+    
     const owner = repo.owner?.login || state.ghUser;
     if (state.selectedRepos.find(r => r.name === repoName && r.owner === owner)) return;
-    setState(s => ({ ...s, selectedRepos: [...s.selectedRepos, { name: repoName, owner }] }));
+
+    setState(s => ({
+      ...s,
+      selectedRepos: [...s.selectedRepos, { name: repoName, owner }]
+    }));
   };
 
   const handleRemoveRepo = (index: number) => {
-    setState(s => ({ ...s, selectedRepos: s.selectedRepos.filter((_, i) => i !== index) }));
+    setState(s => ({
+      ...s,
+      selectedRepos: s.selectedRepos.filter((_, i) => i !== index)
+    }));
   };
 
   const handleGenerate = async () => {
@@ -302,14 +352,23 @@ export default function App() {
       setState(s => ({ ...s, status: 'Error: Write an art prompt first' }));
       return;
     }
+
     if (state.selectedRepos.length === 0) {
       setState(s => ({ ...s, status: 'Error: Add at least one repo to the mix' }));
       return;
     }
-    if (!geminiKey) {
-      setState(s => ({ ...s, status: 'Error: Set your Gemini API key first' }));
-      setIsKeyModalOpen(true);
-      return;
+
+    // Check for key if using a paid model
+    const isPaidModel = state.model.includes('gemini-3');
+    if (isPaidModel && window.aistudio?.hasSelectedApiKey) {
+      const selected = await window.aistudio.hasSelectedApiKey();
+      if (!selected) {
+        setState(s => ({ ...s, status: 'Error: Please select a paid API key' }));
+        if (window.aistudio?.openSelectKey) {
+          await window.aistudio.openSelectKey();
+        }
+        return;
+      }
     }
 
     setState(s => ({ ...s, isGenerating: true, status: 'reading repo...', lastResults: [] }));
@@ -324,7 +383,7 @@ export default function App() {
           const isRetryable = e.message?.includes('503') || e.message?.includes('high demand') || e.message?.includes('UNAVAILABLE');
           if (isRetryable && i < maxRetries - 1) {
             const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
-            setState(s => ({ ...s, status: `Busy... retrying in ${Math.round(delay / 1000)}s (attempt ${i + 1}/${maxRetries})` }));
+            setState(s => ({ ...s, status: `Busy... retrying in ${Math.round(delay/1000)}s (attempt ${i + 1}/${maxRetries})` }));
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
@@ -335,17 +394,20 @@ export default function App() {
     };
 
     try {
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      // Create fresh instance before calls
+      // Use process.env.API_KEY if available (injected from key selection dialog)
+      const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+      const ai = new GoogleGenAI({ apiKey });
 
       // Step 1: Repo Contexts
       setState(s => ({ ...s, status: `reading ${state.selectedRepos.length} repo(s)...` }));
       const repoContexts = await Promise.all(
         state.selectedRepos.map(r => getRepoContext(state.ghToken, r.owner, r.name))
       );
-
+      
       // Step 2: Gemini Vibe Fusion
       setState(s => ({ ...s, status: 'fusing prompt with repo DNA...' }));
-
+      
       const systemPrompt = `
         You are a visual art director who reads code repositories and translates their essence into rich, specific image generation prompts.
         Given metadata, file structures, and READMEs from one or more repositories, extract:
@@ -386,7 +448,10 @@ export default function App() {
       const vibeResponse = await callWithRetry(() => ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: userMsg,
-        config: { systemInstruction: systemPrompt, temperature: 1.0 }
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 1.0,
+        }
       }));
 
       const fusedPrompt = vibeResponse.text?.trim() || '';
@@ -394,9 +459,9 @@ export default function App() {
 
       // Step 3: Image Generation
       setState(s => ({ ...s, status: `generating ${state.count} image${state.count > 1 ? 's' : ''}...` }));
-
+      
       const actualRatio = state.aspectRatio === 'custom' ? `${state.customRatio.w}:${state.customRatio.h}` : state.aspectRatio;
-
+      
       const modifiers = [
         actualRatio ? `${actualRatio} aspect ratio` : '',
         state.resolution ? `${state.resolution} resolution` : '',
@@ -407,17 +472,24 @@ export default function App() {
       ].filter(Boolean).join(', ');
 
       const fullPrompt = `${fusedPrompt}. ${modifiers}`;
-
+      
       const results: ImageResult[] = [];
       for (let i = 0; i < state.count; i++) {
         const parts: any[] = [];
         if (state.userImage && state.userImageMimeType) {
-          parts.push({ inlineData: { data: state.userImage, mimeType: state.userImageMimeType } });
+          parts.push({
+            inlineData: {
+              data: state.userImage,
+              mimeType: state.userImageMimeType
+            }
+          });
         }
         parts.push({ text: fullPrompt });
 
         const isNanoBananaSeries = state.model.includes('image');
-        const config: any = { temperature: 1.0 };
+        const config: any = {
+          temperature: 1.0,
+        };
 
         if (isNanoBananaSeries) {
           config.imageConfig = {
@@ -444,41 +516,42 @@ export default function App() {
         }
       }
 
-      setState(s => ({
-        ...s,
-        lastResults: results,
-        isGenerating: false,
-        status: `✓ done — ${results.length} image${results.length > 1 ? 's' : ''} generated`
+      setState(s => ({ 
+        ...s, 
+        lastResults: results, 
+        isGenerating: false, 
+        status: `✓ done — ${results.length} image${results.length > 1 ? 's' : ''} generated` 
       }));
 
-      // Save to local history
-      if (results.length > 0) {
-        const newItem: HistoryItem = {
-          id: crypto.randomUUID(),
-          prompt: state.artPrompt,
-          negPrompt: state.negPrompt,
-          fusedPrompt,
-          repos: state.selectedRepos.map(r => r.name),
-          model: state.model,
-          aspectRatio: state.aspectRatio,
-          resolution: state.resolution,
-          qualityPreset: state.qualityPreset,
-          lighting: state.lighting,
-          renderStyle: state.renderStyle,
-          images: results.map(r => ({ base64: r.base64, mimeType: r.mimeType })),
-          createdAt: new Date().toISOString(),
-        };
-        const { items, warning } = saveToHistory(newItem, history);
-        setHistory(items);
-        if (warning) {
-          setState(s => ({ ...s, status: `✓ done — ${results.length} image(s) generated. ⚠ ${warning}` }));
+      // Save to History if logged in
+      if (user) {
+        try {
+          await addDoc(collection(db, 'renders'), {
+            userId: user.uid,
+            prompt: state.artPrompt,
+            negPrompt: state.negPrompt,
+            fusedPrompt: fusedPrompt,
+            repos: state.selectedRepos.map(r => r.name),
+            model: state.model,
+            aspectRatio: state.aspectRatio,
+            resolution: state.resolution,
+            qualityPreset: state.qualityPreset,
+            lighting: state.lighting,
+            renderStyle: state.renderStyle,
+            images: results.map(r => ({ base64: r.base64, mimeType: r.mimeType })),
+            createdAt: serverTimestamp()
+          });
+        } catch (error) {
+          console.error("Failed to save to history", error);
         }
       }
 
     } catch (e: any) {
-      if (e.message?.includes('API_KEY_INVALID') || e.message?.includes('PERMISSION_DENIED') || e.message?.includes('not have permission')) {
-        setState(s => ({ ...s, isGenerating: false, status: 'Error: Invalid or missing API key.' }));
-        setIsKeyModalOpen(true);
+      if (e.message?.includes('PERMISSION_DENIED') || e.message?.includes('not have permission')) {
+        setState(s => ({ ...s, isGenerating: false, status: 'Error: Permission Denied. Please select a paid API key.' }));
+        if (window.aistudio?.openSelectKey) {
+          window.aistudio.openSelectKey();
+        }
       } else {
         setState(s => ({ ...s, isGenerating: false, status: `Error: ${e.message}` }));
       }
@@ -530,72 +603,6 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-bg text-text font-sans overflow-hidden">
-
-      {/* Gemini API Key Modal */}
-      <AnimatePresence>
-        {isKeyModalOpen && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] bg-bg/95 backdrop-blur-sm flex items-center justify-center p-4"
-            onClick={() => setIsKeyModalOpen(false)}
-          >
-            <motion.div
-              initial={{ scale: 0.95, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-panel border border-border p-6 max-w-sm w-full shadow-2xl rounded-sm"
-              onClick={e => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between mb-4 border-b border-border pb-3">
-                <div className="flex items-center gap-2">
-                  <Key className="w-4 h-4 text-accent" />
-                  <h2 className="text-[0.8rem] font-bold tracking-[0.2em] uppercase">Gemini API Key</h2>
-                </div>
-                <button onClick={() => setIsKeyModalOpen(false)} className="text-muted hover:text-accent">
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              <p className="text-[0.65rem] text-muted mb-4 leading-relaxed">
-                Enter your Gemini API key. It is stored <strong className="text-text">only in your browser's localStorage</strong> and never sent anywhere except directly to the Gemini API.
-              </p>
-              <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">API Key</label>
-              <input
-                type="password"
-                placeholder="AIza..."
-                className="w-full text-[0.7rem] bg-bg border-border focus:border-accent mb-4"
-                value={keyInput}
-                onChange={e => setKeyInput(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleSaveKey()}
-                autoFocus
-              />
-              <div className="flex gap-2">
-                <button
-                  onClick={handleSaveKey}
-                  disabled={!keyInput.trim()}
-                  className="flex-1 bg-accent text-bg text-[0.7rem] py-2 uppercase font-bold hover:bg-white transition-colors disabled:opacity-40"
-                >
-                  Save Key
-                </button>
-                {geminiKey && !import.meta.env.VITE_GEMINI_API_KEY && (
-                  <button
-                    onClick={handleClearKey}
-                    className="px-3 py-2 border border-accent3/40 text-accent3 text-[0.65rem] uppercase font-bold hover:border-accent3 transition-colors"
-                    title="Remove stored key"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-              <p className="text-[0.55rem] text-muted mt-3">
-                Tip: set <code className="text-accent2">VITE_GEMINI_API_KEY</code> in <code className="text-accent2">.env.local</code> to skip this step.
-              </p>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {/* Header */}
       <header className="flex flex-col sm:flex-row justify-between items-center px-4 sm:px-6 py-3 sm:py-4 border-b border-border shrink-0 gap-3">
         <div className="flex flex-col items-center sm:items-start text-center sm:text-left">
@@ -607,13 +614,13 @@ export default function App() {
 
         {/* Mobile Tab Switcher */}
         <div className="flex md:hidden border border-border rounded-sm overflow-hidden">
-          <button
+          <button 
             onClick={() => setActiveTab('controls')}
             className={`px-4 py-1.5 text-[0.65rem] font-mono uppercase transition-colors ${activeTab === 'controls' ? 'bg-accent text-bg' : 'bg-panel2 text-muted'}`}
           >
             Input
           </button>
-          <button
+          <button 
             onClick={() => setActiveTab('results')}
             className={`px-4 py-1.5 text-[0.65rem] font-mono uppercase transition-colors ${activeTab === 'results' ? 'bg-accent text-bg' : 'bg-panel2 text-muted'}`}
           >
@@ -623,7 +630,7 @@ export default function App() {
 
         <div className="flex items-center gap-3 sm:gap-4 relative">
           {/* History Button */}
-          <button
+          <button 
             onClick={() => setIsHistoryOpen(!isHistoryOpen)}
             className={`p-2 rounded-full transition-colors ${isHistoryOpen ? 'bg-accent text-bg' : 'text-muted hover:text-accent'}`}
             title="History"
@@ -631,71 +638,148 @@ export default function App() {
             <History className="w-5 h-5" />
           </button>
 
-          {/* GitHub Settings */}
           <div className="relative">
-            <button
-              onClick={() => setIsGhOpen(!isGhOpen)}
+            <button 
+              onClick={() => setIsAuthOpen(!isAuthOpen)}
               className={`text-[0.65rem] tracking-[0.12em] px-3 py-1 uppercase font-bold transition-colors flex items-center gap-1.5 ${state.repos.length > 0 ? 'bg-panel2 text-accent2 border border-accent2' : 'bg-accent text-bg'}`}
             >
-              <Github className="w-3 h-3" />
-              {state.repos.length > 0 ? 'GH: Connected' : 'Connect GitHub'}
+              {user ? (
+                <>
+                  <img src={user.photoURL || ''} className="w-4 h-4 rounded-full" referrerPolicy="no-referrer" />
+                  <span className="max-w-[80px] truncate">{user.displayName?.split(' ')[0]}</span>
+                </>
+              ) : (
+                <>
+                  <Github className="w-3 h-3" />
+                  {state.repos.length > 0 ? 'GH: Connected' : 'Connect GitHub'}
+                </>
+              )}
             </button>
 
             <AnimatePresence>
-              {isGhOpen && (
-                <motion.div
+              {isAuthOpen && (
+                <motion.div 
                   initial={{ opacity: 0, y: 10, scale: 0.95 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 10, scale: 0.95 }}
                   className="absolute right-0 mt-2 w-72 bg-panel border border-border shadow-2xl z-50 p-4 rounded-sm"
                 >
-                  <div className="text-[0.65rem] font-mono uppercase text-muted mb-3 tracking-widest border-b border-border pb-2">GitHub Settings</div>
-                  <div className="flex flex-col gap-3">
-                    <div>
-                      <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Personal Access Token</label>
-                      <input
-                        type="password"
-                        placeholder="ghp_xxxxxxxxxxxx"
-                        className="w-full text-[0.7rem] bg-bg border-border focus:border-accent"
-                        value={state.ghToken}
-                        onChange={e => setState(s => ({ ...s, ghToken: e.target.value }))}
-                      />
+                  {user ? (
+                    <div className="flex flex-col gap-4">
+                      <div className="flex items-center gap-3 border-b border-border pb-3">
+                        <img src={user.photoURL || ''} className="w-10 h-10 rounded-full" referrerPolicy="no-referrer" />
+                        <div className="flex flex-col">
+                          <div className="text-[0.7rem] font-bold text-text">{user.displayName}</div>
+                          <div className="text-[0.6rem] text-muted truncate max-w-[150px]">{user.email}</div>
+                        </div>
+                      </div>
+                      
+                      <div className="text-[0.65rem] font-mono uppercase text-muted tracking-widest border-b border-border pb-1">GitHub Settings</div>
+                      <div className="flex flex-col gap-3">
+                        <div>
+                          <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Personal Access Token</label>
+                          <input 
+                            type="password" 
+                            placeholder="ghp_xxxxxxxxxxxx" 
+                            className="w-full text-[0.7rem] bg-bg border-border focus:border-accent"
+                            value={state.ghToken}
+                            onChange={e => setState(s => ({ ...s, ghToken: e.target.value }))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Username</label>
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              placeholder="username" 
+                              className="flex-1 text-[0.7rem] bg-bg border-border focus:border-accent"
+                              value={state.ghUser}
+                              onChange={e => setState(s => ({ ...s, ghUser: e.target.value }))}
+                            />
+                            <button 
+                              onClick={() => {
+                                handleLoadRepos();
+                                setIsAuthOpen(false);
+                              }}
+                              disabled={state.isLoadingRepos}
+                              className="bg-accent text-bg text-[0.65rem] px-3 py-1 uppercase font-bold hover:bg-white transition-colors disabled:opacity-50"
+                            >
+                              {state.isLoadingRepos ? <Loader2 className="animate-spin w-3 h-3" /> : 'Load'}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button 
+                        onClick={handleLogout}
+                        className="mt-2 flex items-center justify-center gap-2 text-[0.65rem] uppercase font-bold text-accent3 hover:text-white transition-colors border border-accent3/20 py-2"
+                      >
+                        <LogOut className="w-3 h-3" /> Sign Out
+                      </button>
                     </div>
-                    <div>
-                      <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Username</label>
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          placeholder="username"
-                          className="flex-1 text-[0.7rem] bg-bg border-border focus:border-accent"
-                          value={state.ghUser}
-                          onChange={e => setState(s => ({ ...s, ghUser: e.target.value }))}
-                        />
-                        <button
-                          onClick={() => { handleLoadRepos(); setIsGhOpen(false); }}
-                          disabled={state.isLoadingRepos}
-                          className="bg-accent text-bg text-[0.65rem] px-3 py-1 uppercase font-bold hover:bg-white transition-colors disabled:opacity-50"
-                        >
-                          {state.isLoadingRepos ? <Loader2 className="animate-spin w-3 h-3" /> : 'Load'}
-                        </button>
+                  ) : (
+                    <div className="flex flex-col gap-4">
+                      <div className="text-[0.65rem] font-mono uppercase text-muted mb-1 tracking-widest border-b border-border pb-1">Sign In</div>
+                      <p className="text-[0.6rem] text-muted leading-tight">
+                        Sign in with Google to save your render history and repository mixes.
+                      </p>
+                      <button 
+                        onClick={handleLogin}
+                        className="bg-accent text-bg text-[0.7rem] py-2 uppercase font-bold flex items-center justify-center gap-2 hover:bg-white transition-colors"
+                      >
+                        <UserIcon className="w-4 h-4" /> Sign in with Google
+                      </button>
+                      
+                      <div className="text-[0.65rem] font-mono uppercase text-muted mt-2 tracking-widest border-b border-border pb-1">Guest GitHub Settings</div>
+                      <div className="flex flex-col gap-3">
+                        <div>
+                          <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Personal Access Token</label>
+                          <input 
+                            type="password" 
+                            placeholder="ghp_xxxxxxxxxxxx" 
+                            className="w-full text-[0.7rem] bg-bg border-border focus:border-accent"
+                            value={state.ghToken}
+                            onChange={e => setState(s => ({ ...s, ghToken: e.target.value }))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[0.6rem] uppercase tracking-wider text-muted mb-1 block">Username</label>
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              placeholder="username" 
+                              className="flex-1 text-[0.7rem] bg-bg border-border focus:border-accent"
+                              value={state.ghUser}
+                              onChange={e => setState(s => ({ ...s, ghUser: e.target.value }))}
+                            />
+                            <button 
+                              onClick={() => {
+                                handleLoadRepos();
+                                setIsAuthOpen(false);
+                              }}
+                              disabled={state.isLoadingRepos}
+                              className="bg-accent text-bg text-[0.65rem] px-3 py-1 uppercase font-bold hover:bg-white transition-colors disabled:opacity-50"
+                            >
+                              {state.isLoadingRepos ? <Loader2 className="animate-spin w-3 h-3" /> : 'Load'}
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>
           </div>
 
-          {/* API Key Button */}
-          <button
-            onClick={() => { setKeyInput(''); setIsKeyModalOpen(true); }}
-            className={`text-[0.65rem] tracking-[0.12em] px-3 py-1 uppercase font-bold flex items-center gap-1.5 transition-colors ${geminiKey ? 'border border-accent/40 text-muted hover:text-accent hover:border-accent' : 'bg-accent2 text-bg hover:bg-white'}`}
-            title={geminiKey ? 'Gemini key set — click to update' : 'Set Gemini API key'}
-          >
-            <Key className="w-3 h-3" />
-            {geminiKey ? 'Key ✓' : 'Set Key'}
-          </button>
-
+          {hasKey === false && (
+            <button 
+              onClick={handleSelectKey}
+              className="text-[0.65rem] tracking-[0.12em] bg-accent2 text-bg px-3 py-1 uppercase font-bold hover:bg-white transition-colors"
+            >
+              Select API Key
+            </button>
+          )}
           <span className="hidden sm:inline text-[0.65rem] tracking-[0.12em] text-accent border border-accent px-3 py-1 uppercase">
             {MODELS.find(m => m.id === state.model)?.name || 'no model selected'}
           </span>
@@ -705,37 +789,37 @@ export default function App() {
       <div className="flex flex-col md:flex-row flex-1 overflow-hidden min-h-0">
         <AnimatePresence>
           {selectedImage && (
-            <motion.div
+            <motion.div 
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               className="fixed inset-0 z-[100] bg-bg/95 backdrop-blur-sm flex items-center justify-center p-4 md:p-12"
               onClick={() => setSelectedImage(null)}
             >
-              <button
+              <button 
                 className="absolute top-6 right-6 text-muted hover:text-accent transition-colors z-[110]"
                 onClick={() => setSelectedImage(null)}
               >
                 <X className="w-8 h-8" />
               </button>
-
-              <motion.div
+              
+              <motion.div 
                 initial={{ scale: 0.9, opacity: 0 }}
                 animate={{ scale: 1, opacity: 1 }}
                 exit={{ scale: 0.9, opacity: 0 }}
                 className="relative max-w-full max-h-full flex flex-col items-center"
                 onClick={e => e.stopPropagation()}
               >
-                <img
-                  src={`data:${selectedImage.mimeType};base64,${selectedImage.base64}`}
-                  alt="Full view"
+                <img 
+                  src={`data:${selectedImage.mimeType};base64,${selectedImage.base64}`} 
+                  alt="Full view" 
                   className="max-w-full max-h-[85vh] object-contain shadow-2xl border border-border/50"
                   referrerPolicy="no-referrer"
                 />
                 <div className="mt-6 text-center max-w-2xl px-4">
                   <p className="text-[0.7rem] text-muted uppercase tracking-[0.2em] mb-2">Fused Prompt DNA</p>
                   <p className="text-[0.8rem] text-text/80 leading-relaxed italic">"{selectedImage.prompt}"</p>
-                  <button
+                  <button 
                     onClick={() => handleExport(selectedImage, 0)}
                     className="mt-6 bg-accent text-bg px-6 py-2 text-[0.75rem] font-bold uppercase tracking-widest hover:bg-white transition-colors flex items-center gap-2 mx-auto"
                   >
@@ -749,9 +833,9 @@ export default function App() {
 
         <PanelGroup direction="horizontal" className="flex-1">
           {/* Left Panel: Controls */}
-          <Panel
-            defaultSize={25}
-            minSize={20}
+          <Panel 
+            defaultSize={25} 
+            minSize={20} 
             maxSize={40}
             className={`${activeTab === 'controls' ? 'flex' : 'hidden'} md:flex border-b md:border-b-0 md:border-r border-border flex-col bg-panel min-h-0`}
           >
@@ -761,7 +845,7 @@ export default function App() {
                 <div className="section-label flex items-center justify-between">
                   <div className="flex items-center gap-1">🧪 THE MIX</div>
                   {state.selectedRepos.length > 0 && (
-                    <button
+                    <button 
                       onClick={() => setState(s => ({ ...s, selectedRepos: [] }))}
                       className="text-[0.6rem] text-muted hover:text-accent3 uppercase tracking-wider"
                     >
@@ -781,7 +865,7 @@ export default function App() {
                           <span className="text-muted opacity-50">{repo.owner}/</span>
                           <span className="font-bold text-accent2">{repo.name}</span>
                         </span>
-                        <button
+                        <button 
                           onClick={() => handleRemoveRepo(idx)}
                           className="ml-2 text-muted opacity-0 group-hover:opacity-100 hover:text-accent3 transition-all"
                         >
@@ -793,7 +877,7 @@ export default function App() {
                 </div>
 
                 <div className="mt-3">
-                  <select
+                  <select 
                     disabled={state.repos.length === 0}
                     className="w-full bg-bg border-accent/30 focus:border-accent text-[0.7rem]"
                     value=""
@@ -812,23 +896,23 @@ export default function App() {
               {/* Prompt Section */}
               <section className="control-section">
                 <div className="section-label flex items-center gap-1">✏️ PROMPT</div>
-
+                
                 <label>Reference Image (Optional)</label>
                 <div className="flex flex-col gap-2 mt-1">
-                  <input
-                    type="file"
+                  <input 
+                    type="file" 
                     accept="image/*"
                     onChange={handleImageUpload}
                     className="text-[0.65rem] file:bg-panel2 file:border-border file:text-text file:px-2 file:py-1 file:mr-2 file:cursor-pointer hover:file:border-accent2"
                   />
                   {state.userImage && (
                     <div className="relative w-full aspect-video bg-panel2 border border-border overflow-hidden">
-                      <img
-                        src={`data:${state.userImageMimeType};base64,${state.userImage}`}
-                        alt="Reference"
+                      <img 
+                        src={`data:${state.userImageMimeType};base64,${state.userImage}`} 
+                        alt="Reference" 
                         className="w-full h-full object-contain"
                       />
-                      <button
+                      <button 
                         onClick={() => setState(s => ({ ...s, userImage: null, userImageMimeType: null }))}
                         className="absolute top-1 right-1 bg-bg/80 text-text p-1 text-[0.6rem] hover:text-accent3"
                       >
@@ -839,14 +923,14 @@ export default function App() {
                 </div>
 
                 <label className="mt-2">Art Direction</label>
-                <textarea
+                <textarea 
                   rows={4}
                   placeholder="bioluminescent fractal network, deep space, maximalist, glitch..."
                   value={state.artPrompt}
                   onChange={e => setState(s => ({ ...s, artPrompt: e.target.value }))}
                 />
                 <label>Negative Prompt</label>
-                <textarea
+                <textarea 
                   rows={2}
                   placeholder="blur, watermark, text, low quality, ugly..."
                   value={state.negPrompt}
@@ -859,7 +943,7 @@ export default function App() {
                 <div className="section-label flex items-center gap-1">🍌 MODEL</div>
                 <div className="flex flex-col gap-2">
                   {MODELS.map(m => (
-                    <div
+                    <div 
                       key={m.id}
                       onClick={() => setState(s => ({ ...s, model: m.id }))}
                       className={`model-card ${state.model === m.id ? 'selected' : ''}`}
@@ -877,7 +961,7 @@ export default function App() {
                 <label>Aspect Ratio</label>
                 <div className="grid grid-cols-4 gap-1.5">
                   {RATIOS.map(r => (
-                    <button
+                    <button 
                       key={r.id}
                       onClick={() => setState(s => ({ ...s, aspectRatio: r.id }))}
                       className={`ratio-btn ${state.aspectRatio === r.id ? 'selected' : ''}`}
@@ -888,15 +972,15 @@ export default function App() {
                 </div>
                 {state.aspectRatio === 'custom' && (
                   <div className="flex items-center gap-2 mt-2">
-                    <input
-                      type="number"
+                    <input 
+                      type="number" 
                       className="w-16 text-center"
                       value={state.customRatio.w}
                       onChange={e => setState(s => ({ ...s, customRatio: { ...s.customRatio, w: parseInt(e.target.value) || 1 } }))}
                     />
                     <span className="text-muted">:</span>
-                    <input
-                      type="number"
+                    <input 
+                      type="number" 
                       className="w-16 text-center"
                       value={state.customRatio.h}
                       onChange={e => setState(s => ({ ...s, customRatio: { ...s.customRatio, h: parseInt(e.target.value) || 1 } }))}
@@ -906,7 +990,7 @@ export default function App() {
                 <label className="mt-4">Resolution Target</label>
                 <div className="grid grid-cols-5 gap-1.5">
                   {RESOLUTIONS.map(res => (
-                    <button
+                    <button 
                       key={res.id}
                       onClick={() => setState(s => ({ ...s, resolution: res.id }))}
                       className={`res-btn ${state.resolution === res.id ? 'selected' : ''}`}
@@ -958,7 +1042,7 @@ export default function App() {
                 <label>Output Count</label>
                 <div className="flex gap-2">
                   {[1, 2, 3, 4].map(n => (
-                    <button
+                    <button 
                       key={n}
                       onClick={() => setState(s => ({ ...s, count: n }))}
                       className={`count-btn flex-1 ${state.count === n ? 'selected' : ''}`}
@@ -972,7 +1056,7 @@ export default function App() {
 
             {/* Generate Section */}
             <section className="control-section border-t border-border bg-panel2 shrink-0">
-              <button
+              <button 
                 id="generate-btn"
                 disabled={state.isGenerating || state.selectedRepos.length === 0}
                 onClick={handleGenerate}
@@ -992,14 +1076,14 @@ export default function App() {
           </PanelResizeHandle>
 
           {/* Right Panel: Output */}
-          <Panel
+          <Panel 
             defaultSize={75}
             className={`${activeTab === 'results' ? 'flex' : 'hidden'} md:flex flex-1 flex flex-col overflow-hidden bg-bg relative`}
           >
             {/* History Overlay */}
             <AnimatePresence>
               {isHistoryOpen && (
-                <motion.div
+                <motion.div 
                   initial={{ opacity: 0, x: 300 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 300 }}
@@ -1009,35 +1093,34 @@ export default function App() {
                     <div className="flex items-center gap-3">
                       <History className="w-5 h-5 text-accent" />
                       <h2 className="text-[0.8rem] font-bold tracking-[0.2em] uppercase">Alchemy History</h2>
-                      {history.length > 0 && (
-                        <span className="text-[0.6rem] text-muted border border-border px-1.5 py-0.5">{history.length}/{HISTORY_MAX}</span>
-                      )}
                     </div>
-                    <div className="flex items-center gap-3">
-                      {history.length > 0 && (
-                        <button
-                          onClick={handleClearHistory}
-                          className="text-[0.6rem] text-accent3/60 hover:text-accent3 uppercase tracking-widest flex items-center gap-1 transition-colors"
-                          title="Clear all history"
-                        >
-                          <Trash2 className="w-3 h-3" /> Clear
-                        </button>
-                      )}
-                      <button
-                        onClick={() => setIsHistoryOpen(false)}
-                        className="text-muted hover:text-accent transition-colors text-[0.7rem] uppercase tracking-widest"
-                      >
-                        Close [esc]
-                      </button>
-                    </div>
+                    <button 
+                      onClick={() => setIsHistoryOpen(false)}
+                      className="text-muted hover:text-accent transition-colors text-[0.7rem] uppercase tracking-widest"
+                    >
+                      Close [esc]
+                    </button>
                   </div>
 
                   <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
-                    {history.length === 0 ? (
+                    {!user ? (
+                      <div className="h-full flex flex-col items-center justify-center text-center gap-4 opacity-50">
+                        <Lock className="w-12 h-12" />
+                        <div>
+                          <p className="text-[0.75rem] font-bold uppercase tracking-widest mb-1">History Locked</p>
+                          <p className="text-[0.65rem] max-w-[200px]">Sign in to persist your renders across sessions.</p>
+                        </div>
+                        <button 
+                          onClick={handleLogin}
+                          className="bg-accent text-bg text-[0.7rem] px-6 py-2 uppercase font-bold hover:bg-white transition-colors mt-2"
+                        >
+                          Sign In
+                        </button>
+                      </div>
+                    ) : history.length === 0 ? (
                       <div className="h-full flex flex-col items-center justify-center text-center gap-4 opacity-30">
                         <Clock className="w-12 h-12" />
                         <p className="text-[0.75rem] font-bold uppercase tracking-widest">No Renders Yet</p>
-                        <p className="text-[0.6rem] max-w-[220px]">Generate some images and they'll appear here, even after you close the page.</p>
                       </div>
                     ) : (
                       <div className="grid gap-8">
@@ -1046,7 +1129,7 @@ export default function App() {
                             <div className="flex gap-4 mb-4">
                               <div className="flex-1">
                                 <div className="text-[0.6rem] text-accent2 font-bold uppercase tracking-widest mb-1">
-                                  {new Date(item.createdAt).toLocaleDateString()} @ {new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  {item.createdAt?.toDate().toLocaleDateString()} @ {item.createdAt?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                 </div>
                                 <div className="text-[0.75rem] font-medium text-text line-clamp-2 mb-2 italic">"{item.prompt}"</div>
                                 <div className="flex flex-wrap gap-1">
@@ -1058,7 +1141,7 @@ export default function App() {
                                 </div>
                               </div>
                               <div className="flex flex-col gap-2">
-                                <button
+                                <button 
                                   onClick={() => {
                                     setState(s => ({
                                       ...s,
@@ -1070,7 +1153,7 @@ export default function App() {
                                       qualityPreset: item.qualityPreset,
                                       lighting: item.lighting,
                                       renderStyle: item.renderStyle,
-                                      lastResults: item.images.map(img => ({ ...img, prompt: item.fusedPrompt })),
+                                      lastResults: item.images,
                                       fusedPrompt: item.fusedPrompt
                                     }));
                                     setIsHistoryOpen(false);
@@ -1082,28 +1165,24 @@ export default function App() {
                                 </button>
                               </div>
                             </div>
-                            {item.images.length > 0 ? (
-                              <div className="grid grid-cols-4 gap-2">
-                                {item.images.map((img, idx) => (
-                                  <div key={idx} className="aspect-square bg-panel2 border border-border overflow-hidden relative group/img">
-                                    <img
-                                      src={`data:${img.mimeType};base64,${img.base64}`}
-                                      className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
-                                      referrerPolicy="no-referrer"
-                                    />
-                                    <button
-                                      onClick={() => setSelectedImage({ ...img, prompt: item.fusedPrompt })}
-                                      className="absolute inset-0 flex items-center justify-center bg-bg/40 opacity-0 group-hover/img:opacity-100 transition-opacity"
-                                      title="View Large"
-                                    >
-                                      <Maximize2 className="w-4 h-4 text-white" />
-                                    </button>
-                                  </div>
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="text-[0.6rem] text-muted italic opacity-50">Images pruned due to storage limits</div>
-                            )}
+                            <div className="grid grid-cols-4 gap-2">
+                              {item.images.map((img, idx) => (
+                                <div key={idx} className="aspect-square bg-panel2 border border-border overflow-hidden relative group/img">
+                                  <img 
+                                    src={`data:${img.mimeType};base64,${img.base64}`} 
+                                    className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
+                                    referrerPolicy="no-referrer"
+                                  />
+                                  <button 
+                                    onClick={() => setSelectedImage({ ...img, prompt: item.prompt })}
+                                    className="absolute inset-0 flex items-center justify-center bg-bg/40 opacity-0 group-hover/img:opacity-100 transition-opacity"
+                                    title="View Large"
+                                  >
+                                    <Maximize2 className="w-4 h-4 text-white" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -1115,20 +1194,20 @@ export default function App() {
 
             <PanelGroup direction="vertical" className="flex-1">
               {/* Vibe Bar / Prompt Window */}
-              <Panel
-                defaultSize={15}
-                minSize={10}
+              <Panel 
+                defaultSize={15} 
+                minSize={10} 
                 maxSize={40}
                 collapsible={true}
                 className="flex flex-col min-h-0"
               >
                 <AnimatePresence mode="wait">
                   {state.fusedPrompt ? (
-                    <motion.div
+                    <motion.div 
                       key="fused"
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
-                      id="vibe-bar"
+                      id="vibe-bar" 
                       className="flex-1 px-6 py-4 text-[0.75rem] bg-[rgba(0,229,255,0.04)] cursor-pointer group overflow-y-auto custom-scrollbar"
                       onClick={handleSpeak}
                     >
@@ -1160,7 +1239,7 @@ export default function App() {
                       <p className="text-[0.75rem] tracking-[0.15em] uppercase">select a repo, write a prompt, generate</p>
                     </div>
                   )}
-
+                  
                   {state.isGenerating && state.lastResults.length === 0 && (
                     <div className="col-span-full flex flex-col items-center justify-center gap-4 h-full">
                       <Loader2 className="w-12 h-12 text-accent animate-spin" />
@@ -1169,19 +1248,19 @@ export default function App() {
                   )}
 
                   {state.lastResults.map((img, i) => (
-                    <motion.div
+                    <motion.div 
                       key={i}
                       initial={{ opacity: 0, scale: 0.95 }}
                       animate={{ opacity: 1, scale: 1 }}
                       className="image-cell group"
                     >
-                      <img
-                        src={`data:${img.mimeType};base64,${img.base64}`}
-                        alt={`Generated ${i + 1}`}
+                      <img 
+                        src={`data:${img.mimeType};base64,${img.base64}`} 
+                        alt={`Generated ${i + 1}`} 
                         referrerPolicy="no-referrer"
                       />
                       <div className="absolute top-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button
+                        <button 
                           onClick={() => setSelectedImage(img)}
                           className="bg-bg/80 text-text p-2 rounded-sm hover:text-accent transition-colors"
                           title="Maximize"
@@ -1189,7 +1268,7 @@ export default function App() {
                           <Maximize2 className="w-4 h-4" />
                         </button>
                       </div>
-                      <button
+                      <button 
                         onClick={() => handleExport(img, i)}
                         className="cell-export flex items-center gap-1"
                       >
@@ -1202,12 +1281,12 @@ export default function App() {
                 {/* Export Bar */}
                 <AnimatePresence>
                   {state.lastResults.length > 0 && (
-                    <motion.div
+                    <motion.div 
                       initial={{ y: 50, opacity: 0 }}
                       animate={{ y: 0, opacity: 1 }}
                       className="px-6 py-3 border-t border-border flex items-center gap-4 shrink-0 bg-panel"
                     >
-                      <button
+                      <button 
                         onClick={() => state.lastResults.forEach((img, i) => setTimeout(() => handleExport(img, i), i * 300))}
                         className="bg-panel2 border border-border2 text-text text-[0.75rem] px-4 py-2 hover:border-success hover:text-success transition-colors flex items-center gap-2"
                       >
